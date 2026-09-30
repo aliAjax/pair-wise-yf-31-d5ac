@@ -1,3 +1,91 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>航班恢复控制台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}</style>
-<h1>航班恢复控制台</h1><p>查看航班、中断事件与恢复方案。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p><section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:15px system-ui;max-width:1200px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}
+h1{margin-bottom:4px} .sub{color:#475467;margin-top:0}
+section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}
+table{border-collapse:collapse;width:100%;font-size:14px} th,td{padding:6px 8px;text-align:left;border-bottom:1px solid #e4e7ec;white-space:nowrap}
+th{background:#f8fafc;color:#475467;font-weight:600}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;font-weight:600}
+.badge.scheduled{background:#dcfce7;color:#166534}
+.badge.canceled{background:#fee2e2;color:#991b1b}
+.badge.pending_review{background:#fef3c7;color:#92400e}
+.badge.draft{background:#e0e7ff;color:#3730a3}
+.badge.locked{background:#dcfce7;color:#166534}
+.badge.expired{background:#fee2e2;color:#991b1b}
+.badge.reverted{background:#f1f5f9;color:#475467}
+.badge.active{background:#dcfce7;color:#166534}
+.badge.planned{background:#e0e7ff;color:#3730a3}
+.badge.reverted{background:#f1f5f9;color:#475467}
+button{font:inherit;padding:5px 10px;margin:2px;border:0;border-radius:6px;background:#0f766e;color:white;cursor:pointer}
+button.gray{background:#475467}button.amber{background:#b45309}button.red{background:#b91c1c}
+button:disabled{background:#cbd5e1;cursor:not-allowed}
+code{background:#f1f5f9;padding:1px 5px;border-radius:4px;font-size:13px}
+#result{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px;font-size:13px;min-height:40px;white-space:pre-wrap}
+.muted{color:#98a2b3} .expired-row{background:#fef2f2}
+</style>
+<h1>航班恢复控制台</h1><p class="sub">中断事件、恢复方案与航班执行共用修订链路。中断更新后，依赖旧版本的锁定方案失效、未执行航班转待复核；恢复只撤掉本方案写入的值。</p>
+<section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新状态</button></section>
+<section><h2>处理结果</h2><div id="result">等待操作…</div></section>
+<section><h2>中断事件 <span class="muted">（修订链路起点）</span></h2><div id="disruptions"></div></section>
+<section><h2>航班 <span class="muted">（待复核 = 中断窗口变更后需重做）</span></h2><div id="flights"></div></section>
+<section><h2>恢复方案 <span class="muted">（过期方案需恢复后重做）</span></h2><div id="plans"></div></section>
+<script>
+const $=id=>document.getElementById(id);
+async function api(path,method,body){
+  const opt={method:method||'GET',headers:{'Content-Type':'application/json','X-User-Id':u.value,'X-Role':r.value}};
+  if(body!==undefined)opt.body=JSON.stringify(body);
+  const res=await fetch(path,opt); const data=await res.json().catch(()=>({}));
+  if(!res.ok){const e=new Error(data.message||res.status);e.code=data.error;e.details=data.details;e.status=res.status;throw e;}
+  return data;
+}
+function showResult(label,data){$('result').textContent=`【${label}】\n`+JSON.stringify(data,null,2);}
+function showError(label,e){$('result').textContent=`【${label}】失败 ${e.code||''}\n${e.message}\n`+(e.details?JSON.stringify(e.details,null,2):'');}
+function fmt(t){return t?t.replace('T',' ').replace('Z',''):'';}
+function badge(s){return `<span class="badge ${s}">${s}</span>`;}
+
+async function load(){
+  const s=await api('/api/state');
+  // 中断
+  $('disruptions').innerHTML=`<table><tr><th>ID</th><th>类型</th><th>资源</th><th>窗口</th><th>修订</th><th>状态</th><th>操作</th></tr>`+
+    s.disruptions.map(d=>`<tr><td>${d.id}</td><td>${d.kind}</td><td>${d.resource_id}</td>
+    <td>${fmt(d.starts_at)} → ${fmt(d.ends_at)}</td><td>v${d.revision}</td><td>${badge(d.status)}</td>
+    <td><button onclick="bumpDisruption(${d.id},${d.revision},'${d.ends_at}',-1)">缩短1h</button>
+        <button class="amber" onclick="bumpDisruption(${d.id},${d.revision},'${d.ends_at}',1)">延长1h</button></td></tr>`).join('')+`</table>`;
+  // 航班
+  $('flights').innerHTML=`<table><tr><th>航班号</th><th>航线</th><th>时刻</th><th>飞机</th><th>机组</th><th>状态</th><th>修订</th><th>写入方案</th></tr>`+
+    s.flights.map(f=>`<tr class="${f.status==='pending_review'?'expired-row':''}"><td>${f.flight_no}</td><td>${f.origin}→${f.destination}</td>
+    <td>${fmt(f.std)} → ${fmt(f.sta)}</td><td>${f.aircraft_id}</td><td>${f.crew_id}</td><td>${badge(f.status)}</td>
+    <td>v${f.revision}</td><td>${f.applied_plan_id?('<code>#'+f.applied_plan_id+'</code>'):'<span class="muted">—</span>'}</td></tr>`).join('')+`</table>`;
+  // 方案
+  $('plans').innerHTML=`<table><tr><th>ID</th><th>名称</th><th>中断</th><th>状态</th><th>方案修订</th><th>依赖中断修订</th><th>成本分</th><th>调整项</th><th>操作</th></tr>`+
+    s.plans.map(p=>`<tr class="${p.status==='expired'?'expired-row':''}"><td>${p.id}</td><td>${p.name}</td><td>#${p.disruption_id}</td>
+    <td>${badge(p.status)}</td><td>v${p.revision}</td><td>${p.disruption_revision?('v'+p.disruption_revision):'<span class="muted">—</span>'}</td>
+    <td>${p.score?p.score.cost_score:'<span class="muted">未评分</span>'}</td>
+    <td>${p.assignments.map(a=>badge(a.status)).join(' ')}</td>
+    <td><button class="gray" onclick="validatePlan(${p.id})">校验</button>
+        <button onclick="lockPlan(${p.id},${p.revision})" ${p.status==='locked'?'disabled':''}>锁定</button>
+        <button class="red" onclick="revertPlan(${p.id})" ${(p.status==='draft'||p.status==='reverted')?'disabled':''}>恢复</button></td></tr>`).join('')+`</table>`;
+}
+
+async function bumpDisruption(id,rev,endsAt,delta){
+  try{
+    const end=new Date(endsAt); end.setHours(end.getHours()+delta);
+    const d=await api(`/api/disruptions/${id}`,'POST',{ends_at:end.toISOString()});
+    showResult(`中断 #${id} 更新 → v${d.disruption.revision}，失效方案 ${d.expired_plan_ids.length} 个，待复核航班 ${d.pending_review_flight_ids.length} 架`,d);
+    load();
+  }catch(e){showError(`中断 #${id} 更新`,e);}
+}
+async function validatePlan(id){
+  try{const d=await api(`/api/plans/${id}/validate`,'POST',{});showResult(`方案 #${id} 校验 ${d.valid?'通过':'未通过'}`,d);load();}
+  catch(e){showError(`方案 #${id} 校验`,e);}
+}
+async function lockPlan(id,rev){
+  try{const d=await api(`/api/plans/${id}/lock`,'POST',{expected_revision:rev});showResult(`方案 #${id} 已锁定`,d);load();}
+  catch(e){showError(`方案 #${id} 锁定`,e);}
+}
+async function revertPlan(id){
+  try{const d=await api(`/api/plans/${id}/revert`,'POST',{});showResult(`方案 #${id} 已恢复：撤回 ${d.reverted.length} 项，跳过 ${d.skipped.length} 项`,d);load();}
+  catch(e){showError(`方案 #${id} 恢复`,e);}
+}
+load();
+</script>

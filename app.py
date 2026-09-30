@@ -81,12 +81,17 @@ class Repository:
                 id INTEGER PRIMARY KEY AUTOINCREMENT, flight_no TEXT NOT NULL UNIQUE, origin TEXT NOT NULL, destination TEXT NOT NULL,
                 std TEXT NOT NULL, sta TEXT NOT NULL, aircraft_id TEXT NOT NULL REFERENCES aircraft(id), crew_id TEXT NOT NULL REFERENCES crew(id),
                 passenger_count INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'scheduled', delay_minutes INTEGER NOT NULL DEFAULT 0,
-                revision INTEGER NOT NULL DEFAULT 1, cancel_reason TEXT, updated_at TEXT NOT NULL
+                revision INTEGER NOT NULL DEFAULT 1, cancel_reason TEXT,
+                applied_plan_id INTEGER REFERENCES recovery_plans(id), updated_at TEXT NOT NULL
             );
-            CREATE TABLE IF NOT EXISTS disruptions(id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, resource_id TEXT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS disruptions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, resource_id TEXT NOT NULL, starts_at TEXT NOT NULL, ends_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active', revision INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS recovery_plans(
                 id INTEGER PRIMARY KEY AUTOINCREMENT, disruption_id INTEGER NOT NULL REFERENCES disruptions(id), name TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'draft', revision INTEGER NOT NULL DEFAULT 1, score_json TEXT, metrics_json TEXT,
+                status TEXT NOT NULL DEFAULT 'draft', revision INTEGER NOT NULL DEFAULT 1, disruption_revision INTEGER,
+                score_json TEXT, metrics_json TEXT,
                 created_by TEXT NOT NULL, created_at TEXT NOT NULL, locked_at TEXT, locked_by TEXT
             );
             CREATE TABLE IF NOT EXISTS assignments(
@@ -95,9 +100,31 @@ class Repository:
                 new_std TEXT NOT NULL, new_sta TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'planned', delay_minutes INTEGER NOT NULL DEFAULT 0,
                 missed_connections INTEGER NOT NULL DEFAULT 0, UNIQUE(plan_id,flight_id)
             );
+            CREATE TABLE IF NOT EXISTS flight_snapshots(
+                plan_id INTEGER NOT NULL REFERENCES recovery_plans(id) ON DELETE CASCADE,
+                flight_id INTEGER NOT NULL REFERENCES flights(id),
+                std TEXT NOT NULL, sta TEXT NOT NULL, aircraft_id TEXT NOT NULL, crew_id TEXT NOT NULL,
+                delay_minutes INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL, cancel_reason TEXT,
+                PRIMARY KEY (plan_id, flight_id)
+            );
             CREATE TABLE IF NOT EXISTS audit_log(id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL, detail_json TEXT NOT NULL, created_at TEXT NOT NULL);
             """
         )
+        self._migrate()
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        cols = [row[1] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if column not in cols:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+    def _migrate(self) -> None:
+        # 为旧库补齐修订链路所需的列
+        self._ensure_column("disruptions", "revision", "INTEGER NOT NULL DEFAULT 1")
+        self._ensure_column("disruptions", "updated_at", "TEXT")
+        self._ensure_column("recovery_plans", "disruption_revision", "INTEGER")
+        self._ensure_column("flights", "applied_plan_id", "INTEGER REFERENCES recovery_plans(id)")
+        # 旧数据没有 updated_at 时用创建时间兜底
+        self.conn.execute("UPDATE disruptions SET updated_at=created_at WHERE updated_at IS NULL")
 
     @staticmethod
     def audit(conn: sqlite3.Connection, plan_id: int | None, actor: str, role: str, action: str, detail: dict[str, Any]) -> None:
@@ -195,9 +222,45 @@ class AirlineRecoveryService:
         start, end = parse_time(body.get("starts_at")), parse_time(body.get("ends_at"))
         if end <= start: raise ApiError(400, "invalid_times", "中断结束时间必须晚于开始时间")
         with self.repo.tx() as conn:
-            cur = conn.execute("INSERT INTO disruptions(kind,resource_id,starts_at,ends_at,created_at) VALUES(?,?,?,?,?)",
-                               (kind, resource.upper() if kind == "airport_closure" else resource, iso(start), iso(end), iso()))
+            cur = conn.execute("INSERT INTO disruptions(kind,resource_id,starts_at,ends_at,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                               (kind, resource.upper() if kind == "airport_closure" else resource, iso(start), iso(end), iso(), iso()))
             return dict(conn.execute("SELECT * FROM disruptions WHERE id=?", (cur.lastrowid,)).fetchone())
+
+    def update_disruption(self, disruption_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "disruption_forbidden", "当前角色不能更新中断")
+        with self.repo.tx() as conn:
+            disruption = conn.execute("SELECT * FROM disruptions WHERE id=?", (disruption_id,)).fetchone()
+            if not disruption: raise ApiError(404, "disruption_not_found", "中断事件不存在")
+            kind = str(body.get("kind", disruption["kind"])).strip()
+            resource = str(body.get("resource_id", disruption["resource_id"])).strip()
+            if kind not in {"airport_closure", "aircraft_fault", "crew_timeout"} or not resource:
+                raise ApiError(400, "invalid_disruption", "kind 或 resource_id 无效")
+            start = parse_time(body["starts_at"]) if "starts_at" in body else parse_time(disruption["starts_at"])
+            end = parse_time(body["ends_at"]) if "ends_at" in body else parse_time(disruption["ends_at"])
+            if end <= start: raise ApiError(400, "invalid_times", "中断结束时间必须晚于开始时间")
+            new_revision = disruption["revision"] + 1
+            conn.execute("""UPDATE disruptions SET kind=?,resource_id=?,starts_at=?,ends_at=?,revision=?,updated_at=? WHERE id=?""",
+                         (kind, resource.upper() if kind == "airport_closure" else resource, iso(start), iso(end), new_revision, iso(), disruption_id))
+            # 依赖旧版本的锁定方案失效；未执行航班转待复核
+            expired_plan_ids: list[int] = []
+            pending_review_flight_ids: list[int] = []
+            stale = conn.execute("""SELECT * FROM recovery_plans WHERE disruption_id=? AND status='locked'
+                                    AND (disruption_revision IS NULL OR disruption_revision < ?)""",
+                                 (disruption_id, new_revision)).fetchall()
+            for plan in stale:
+                conn.execute("UPDATE recovery_plans SET status='expired' WHERE id=?", (plan["id"],))
+                expired_plan_ids.append(plan["id"])
+                for assignment in conn.execute("SELECT * FROM assignments WHERE plan_id=? AND status!='canceled'", (plan["id"],)).fetchall():
+                    flight = conn.execute("SELECT * FROM flights WHERE id=?", (assignment["flight_id"],)).fetchone()
+                    # 已执行（起飞时间已过）的航班不再重做，只转未执行航班
+                    if flight and flight["status"] != "canceled" and parse_time(flight["std"]) > utcnow():
+                        conn.execute("UPDATE flights SET status='pending_review',updated_at=? WHERE id=?", (iso(), assignment["flight_id"]))
+                        pending_review_flight_ids.append(assignment["flight_id"])
+            Repository.audit(conn, None, actor, role, "disruption_updated",
+                             {"disruption_id": disruption_id, "revision": new_revision,
+                              "expired_plan_ids": expired_plan_ids, "pending_review_flight_ids": pending_review_flight_ids})
+            return {"disruption": dict(conn.execute("SELECT * FROM disruptions WHERE id=?", (disruption_id,)).fetchone()),
+                    "expired_plan_ids": expired_plan_ids, "pending_review_flight_ids": pending_review_flight_ids}
 
     def create_plan(self, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "plan_forbidden", "当前角色不能创建恢复方案")
@@ -206,9 +269,10 @@ class AirlineRecoveryService:
         if not isinstance(disruption_id, int) or not name or not isinstance(assignments, list):
             raise ApiError(400, "invalid_plan", "disruption_id、name 和 assignments 必填")
         with self.repo.tx() as conn:
-            if not conn.execute("SELECT 1 FROM disruptions WHERE id=?", (disruption_id,)).fetchone():
-                raise ApiError(404, "disruption_not_found", "中断事件不存在")
-            cur = conn.execute("INSERT INTO recovery_plans(disruption_id,name,created_by,created_at) VALUES(?,?,?,?)", (disruption_id, name, actor, iso()))
+            disruption = conn.execute("SELECT * FROM disruptions WHERE id=?", (disruption_id,)).fetchone()
+            if not disruption: raise ApiError(404, "disruption_not_found", "中断事件不存在")
+            cur = conn.execute("""INSERT INTO recovery_plans(disruption_id,name,created_by,created_at,disruption_revision)
+                                  VALUES(?,?,?,?,?)""", (disruption_id, name, actor, iso(), disruption["revision"]))
             plan_id = cur.lastrowid
             for item in assignments:
                 self._insert_assignment(conn, plan_id, item, replace=False)
@@ -254,7 +318,9 @@ class AirlineRecoveryService:
             plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
             if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
             if plan["status"] != "draft": raise ApiError(409, "plan_locked", "已锁定方案不能修改")
-            if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案已被其他人更新")
+            if plan["revision"] != expected:
+                raise ApiError(409, "revision_conflict", "方案已被其他人更新",
+                               {"latest_revision": plan["revision"], "latest": self.get_plan(plan_id)})
             self._insert_assignment(conn, plan_id, body, replace=True)
             conn.execute("UPDATE recovery_plans SET revision=revision+1 WHERE id=?", (plan_id,))
             Repository.audit(conn, plan_id, actor, role, "assignment_reassigned", {"flight_id": body.get("flight_id")})
@@ -330,27 +396,82 @@ class AirlineRecoveryService:
         with self.repo.tx() as conn:
             plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
             if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
-            if plan["status"] == "locked": return self.get_plan(plan_id)
-            if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "方案版本已变化")
+            # 幂等：已锁定方案按当前版本重试直接返回；按旧版本重复锁定则报冲突
+            if plan["status"] == "locked":
+                if plan["revision"] != expected:
+                    raise ApiError(409, "revision_conflict", "方案已被其他人锁定",
+                                   {"latest_revision": plan["revision"], "latest": self.get_plan(plan_id)})
+                return self.get_plan(plan_id)
+            if plan["status"] == "expired":
+                raise ApiError(409, "plan_expired", "方案依赖的中断信息已更新，请恢复原方案后重新制定",
+                               {"latest_revision": plan["revision"], "latest": self.get_plan(plan_id)})
+            if plan["revision"] != expected:
+                raise ApiError(409, "revision_conflict", "方案版本已变化",
+                               {"latest_revision": plan["revision"], "latest": self.get_plan(plan_id)})
             problems = self._validate_plan(conn, plan_id)
             if problems: raise ApiError(409, "plan_invalid", "方案未通过约束校验", problems)
             conflicts = []
             for row in conn.execute("SELECT * FROM assignments WHERE plan_id=? AND status!='canceled'", (plan_id,)).fetchall():
                 conflicting = conn.execute("""SELECT a.*,p.name plan_name FROM assignments a JOIN recovery_plans p ON p.id=a.plan_id
-                    WHERE p.id!=? AND p.status='locked' AND a.status!='canceled' AND (a.aircraft_id=? OR a.crew_id=?)
+                    WHERE p.id!=? AND p.status='locked' AND a.status='active' AND (a.aircraft_id=? OR a.crew_id=?)
                     AND a.new_std<? AND a.new_sta>?""",
                     (plan_id, row["aircraft_id"], row["crew_id"], row["new_sta"], row["new_std"])).fetchall()
                 conflicts.extend({"assignment_id": row["id"], "conflict_plan_id": item["plan_id"], "conflict_plan": item["plan_name"], "resource": item["aircraft_id"] if item["aircraft_id"] == row["aircraft_id"] else item["crew_id"]} for item in conflicting)
             if conflicts: raise ApiError(409, "locked_resource_conflict", "与已锁定方案存在飞机或机组冲突", conflicts)
+            disruption = conn.execute("SELECT * FROM disruptions WHERE id=?", (plan["disruption_id"],)).fetchone()
             metrics = self._metrics(conn, plan_id)
-            conn.execute("""UPDATE recovery_plans SET status='locked',metrics_json=?,score_json=?,locked_at=?,locked_by=? WHERE id=?""",
-                         (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor, plan_id))
-            for row in conn.execute("""SELECT a.*,f.flight_no FROM assignments a JOIN flights f ON f.id=a.flight_id WHERE a.plan_id=? AND a.status!='canceled'""", (plan_id,)):
-                conn.execute("UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,revision=revision+1,updated_at=? WHERE id=?",
-                             (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]), iso(), row["flight_id"]))
+            conn.execute("""UPDATE recovery_plans SET status='locked',revision=revision+1,metrics_json=?,score_json=?,locked_at=?,locked_by=?,disruption_revision=? WHERE id=?""",
+                         (json.dumps(metrics, ensure_ascii=False), json.dumps(self._score(metrics)), iso(), actor,
+                          disruption["revision"] if disruption else plan["disruption_revision"], plan_id))
+            # 仅应用尚未生效的调整项：重试时不会重复改航班
+            for row in conn.execute("""SELECT a.*,f.flight_no FROM assignments a JOIN flights f ON f.id=a.flight_id
+                                        WHERE a.plan_id=? AND a.status!='canceled' AND a.status!='active'""", (plan_id,)):
+                flight = conn.execute("SELECT * FROM flights WHERE id=?", (row["flight_id"],)).fetchone()
+                # 快照本方案写入前的航班值，恢复时只撤掉本方案写入的部分
+                conn.execute("""INSERT OR REPLACE INTO flight_snapshots(plan_id,flight_id,std,sta,aircraft_id,crew_id,delay_minutes,status,cancel_reason)
+                                VALUES(?,?,?,?,?,?,?,?,?)""",
+                             (plan_id, row["flight_id"], flight["std"], flight["sta"], flight["aircraft_id"], flight["crew_id"],
+                              flight["delay_minutes"], flight["status"], flight["cancel_reason"]))
+                conn.execute("""UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,status='scheduled',
+                                revision=revision+1,applied_plan_id=?,updated_at=? WHERE id=?""",
+                             (row["new_std"], row["new_sta"], row["aircraft_id"], row["crew_id"], max(0, row["delay_minutes"]),
+                              plan_id, iso(), row["flight_id"]))
                 conn.execute("UPDATE assignments SET status='active' WHERE id=?", (row["id"],))
             Repository.audit(conn, plan_id, actor, role, "plan_locked", {"metrics": metrics})
             return self.get_plan(plan_id)
+
+    def revert_plan(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "revert_forbidden", "当前角色不能恢复方案")
+        with self.repo.tx() as conn:
+            plan = conn.execute("SELECT * FROM recovery_plans WHERE id=?", (plan_id,)).fetchone()
+            if not plan: raise ApiError(404, "plan_not_found", "方案不存在")
+            if plan["status"] not in {"locked", "expired"}:
+                raise ApiError(409, "not_applied", "只有已锁定或已过期的方案可以恢复")
+            reverted: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            for assignment in conn.execute("SELECT * FROM assignments WHERE plan_id=?", (plan_id,)).fetchall():
+                flight = conn.execute("SELECT * FROM flights WHERE id=?", (assignment["flight_id"],)).fetchone()
+                snapshot = conn.execute("SELECT * FROM flight_snapshots WHERE plan_id=? AND flight_id=?",
+                                        (plan_id, assignment["flight_id"])).fetchone()
+                if not flight or not snapshot:
+                    skipped.append({"assignment_id": assignment["id"], "flight_id": assignment["flight_id"], "reason": "no_snapshot"})
+                    continue
+                # 只撤掉本方案写入且仍由本方案持有的航班值；人工改派或其他方案写入的不动
+                if flight["applied_plan_id"] != plan_id:
+                    skipped.append({"assignment_id": assignment["id"], "flight_id": assignment["flight_id"], "reason": "not_current_applier"})
+                    continue
+                if parse_time(flight["std"]) <= utcnow():
+                    skipped.append({"assignment_id": assignment["id"], "flight_id": assignment["flight_id"], "reason": "already_executed"})
+                    continue
+                conn.execute("""UPDATE flights SET std=?,sta=?,aircraft_id=?,crew_id=?,delay_minutes=?,status=?,cancel_reason=?,
+                                revision=revision+1,applied_plan_id=NULL,updated_at=? WHERE id=?""",
+                             (snapshot["std"], snapshot["sta"], snapshot["aircraft_id"], snapshot["crew_id"], snapshot["delay_minutes"],
+                              snapshot["status"], snapshot["cancel_reason"], iso(), assignment["flight_id"]))
+                conn.execute("UPDATE assignments SET status='reverted' WHERE id=?", (assignment["id"],))
+                reverted.append({"assignment_id": assignment["id"], "flight_id": assignment["flight_id"]})
+            conn.execute("UPDATE recovery_plans SET status='reverted' WHERE id=?", (plan_id,))
+            Repository.audit(conn, plan_id, actor, role, "plan_reverted", {"reverted": reverted, "skipped": skipped})
+            return {"plan": self.get_plan(plan_id), "reverted": reverted, "skipped": skipped}
 
     def cancel_flight(self, flight_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"scheduler", "ops_manager"}: raise ApiError(403, "cancel_forbidden", "当前角色不能取消航班")
@@ -360,7 +481,8 @@ class AirlineRecoveryService:
             flight = conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
             if not flight: raise ApiError(404, "flight_not_found", "航班不存在")
             if flight["status"] == "canceled": return {"flight": dict(flight), "idempotent": True}
-            conn.execute("UPDATE flights SET status='canceled',cancel_reason=?,revision=revision+1,updated_at=? WHERE id=?", (reason, iso(), flight_id))
+            # 人工取消会覆盖方案写入，撤销时不再恢复该航班
+            conn.execute("UPDATE flights SET status='canceled',cancel_reason=?,revision=revision+1,applied_plan_id=NULL,updated_at=? WHERE id=?", (reason, iso(), flight_id))
             Repository.audit(conn, None, actor, role, "flight_canceled", {"flight_id": flight_id, "reason": reason})
             return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()), "idempotent": False}
 
@@ -371,13 +493,16 @@ class AirlineRecoveryService:
         with self.repo.tx() as conn:
             flight = conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone()
             if not flight: raise ApiError(404, "flight_not_found", "航班不存在")
-            if flight["revision"] != expected: raise ApiError(409, "revision_conflict", "航班版本已变化")
+            if flight["revision"] != expected:
+                latest = dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())
+                raise ApiError(409, "revision_conflict", "航班版本已变化", {"latest_revision": flight["revision"], "latest": latest})
             if flight["status"] != "canceled": raise ApiError(409, "not_canceled", "只有取消航班可以恢复")
             std, sta = parse_time(body.get("new_std")), parse_time(body.get("new_sta"))
             if sta <= std: raise ApiError(400, "invalid_times", "到达时间必须晚于起飞时间")
             aircraft_id, crew_id = body.get("aircraft_id", flight["aircraft_id"]), body.get("crew_id", flight["crew_id"])
+            # 人工恢复覆盖方案写入，撤销时不再恢复该航班
             conn.execute("""UPDATE flights SET status='scheduled',std=?,sta=?,aircraft_id=?,crew_id=?,cancel_reason=NULL,
-                            delay_minutes=0,revision=revision+1,updated_at=? WHERE id=?""",
+                            delay_minutes=0,revision=revision+1,applied_plan_id=NULL,updated_at=? WHERE id=?""",
                          (iso(std), iso(sta), aircraft_id, crew_id, iso(), flight_id))
             Repository.audit(conn, None, actor, role, "flight_recovered", {"flight_id": flight_id})
             return {"flight": dict(conn.execute("SELECT * FROM flights WHERE id=?", (flight_id,)).fetchone())}
@@ -449,11 +574,14 @@ class Handler(BaseHTTPRequestHandler):
             "/api/recovery-plans": lambda: (201, self.service.create_plan(actor, role, body)),
         }
         if path in table: return table[path]()
+        if len(parts) == 3 and parts[:2] == ["api", "disruptions"] and parts[2].isdigit():
+            return 200, self.service.update_disruption(int(parts[2]), actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
             plan_id, action = int(parts[2]), parts[3]
             if action == "assignments": return 200, self.service.add_assignment(plan_id, actor, role, body)
             if action == "validate": return 200, self.service.validate_plan(plan_id, actor, role)
             if action == "lock": return 200, self.service.lock_plan(plan_id, actor, role, body)
+            if action == "revert": return 200, self.service.revert_plan(plan_id, actor, role, body)
         if len(parts) == 4 and parts[:2] == ["api", "flights"] and parts[2].isdigit():
             flight_id, action = int(parts[2]), parts[3]
             if action == "cancel": return 200, self.service.cancel_flight(flight_id, actor, role, body)
