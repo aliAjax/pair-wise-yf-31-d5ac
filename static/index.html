@@ -1,3 +1,75 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>航班恢复控制台</title>
-<style>body{font:15px system-ui;max-width:1100px;margin:40px auto;background:#eef2f7;color:#182230;padding:0 20px}section{background:white;padding:20px;border-radius:12px;margin:16px 0;box-shadow:0 2px 10px #0001}pre{background:#111827;color:#93c5fd;padding:15px;overflow:auto;border-radius:8px}input,button{font:inherit;padding:8px;margin:4px}button{background:#0f766e;color:white;border:0;border-radius:6px}</style>
-<h1>航班恢复控制台</h1><p>查看航班、中断事件与恢复方案。写操作使用 JSON API 并携带 X-User-Id、X-Role。</p><section><input id="u" value="ops"><input id="r" value="ops_manager"><button onclick="load()">刷新</button><pre id="o"></pre></section><script>async function load(){let x=await fetch('/api/state',{headers:{'X-User-Id':u.value,'X-Role':r.value}});o.textContent=JSON.stringify(await x.json(),null,2)}load()</script>
+<style>
+body{font:14px system-ui;margin:0;background:#eef2f7;color:#182230}.wrap{max-width:1200px;margin:0 auto;padding:20px}
+section{background:#fff;padding:18px 20px;border-radius:12px;margin:14px 0;box-shadow:0 2px 10px #0001}
+h1{font-size:22px}h2{font-size:16px;margin:0 0 10px}input,button{font:inherit;padding:7px 10px;margin:3px}
+button{background:#0f766e;color:#fff;border:0;border-radius:6px;cursor:pointer}button.ghost{background:#e2e8f0;color:#182230}
+table{border-collapse:collapse;width:100%;font-size:13px}th,td{text-align:left;padding:6px 8px;border-bottom:1px solid #eef2f7;vertical-align:top}
+th{color:#475569;font-weight:600}.tag{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:600}
+.t-scheduled{background:#dcfce7;color:#166534}.t-pending_review{background:#fef3c7;color:#92400e}
+.t-executed{background:#dbeafe;color:#1e40af}.t-canceled{background:#fee2e2;color:#991b1b}
+.t-draft{background:#e2e8f0;color:#334155}.t-locked{background:#dbeafe;color:#1e40af}
+.t-stale{background:#fee2e2;color:#991b1b}.t-succeeded{background:#dcfce7;color:#166534}
+.t-failed{background:#fee2e2;color:#991b1b}.t-processing{background:#fef3c7;color:#92400e}
+.t-pending{background:#e2e8f0;color:#334155}.t-reverted{background:#f3e8ff;color:#6b21a8}
+.stale-row{background:#fff7ed}.review-row{background:#fffbeb}.muted{color:#64748b;font-size:12px}
+.banner{border-left:4px solid #d97706;background:#fffbeb;padding:10px 14px;border-radius:6px;margin:8px 0}
+.banner.err{border-color:#dc2626;background:#fef2f2}pre{white-space:pre-wrap;word-break:break-all;font-size:12px;background:#f8fafc;border:1px solid #e2e8f0;padding:8px;border-radius:6px;max-height:240px;overflow:auto}
+</style>
+<div class="wrap">
+<h1>航班恢复调度台</h1>
+<section style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+  <label>用户 <input id="u" value="ops" size="6"></label><label>角色 <input id="r" value="ops_manager" size="12"></label>
+  <button onclick="load()">刷新状态</button><span id="clock" class="muted"></span>
+  <button class="ghost" onclick="raw=!raw;load()">切换 JSON 明细</button>
+</section>
+<div id="banners"></div>
+<section><h2>中断事件（修订链路源头）</h2><div id="disruptions"></div></section>
+<section><h2>航班执行</h2><div id="flights"></div></section>
+<section><h2>恢复方案</h2><div id="plans"></div></section>
+<section id="rawSec" style="display:none"><h2>原始状态 JSON</h2><pre id="rawJson"></pre></section>
+</div>
+<script>
+let raw=false;
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function tag(cls,t){return `<span class="tag t-${cls}">${esc(t)}</span>`}
+const fstatus={scheduled:'计划',pending_review:'待复核',executed:'已执行',canceled:'已取消'};
+const astatus={pending:'待处理',processing:'处理中',succeeded:'已落值',failed:'处理失败',reverted:'已撤稿'};
+async function api(path,body,method='POST'){
+  const x=await fetch(path,{method,headers:{'Content-Type':'application/json','X-User-Id':u.value,'X-Role':r.value},body:body?JSON.stringify(body):undefined});
+  const data=await x.json().catch(()=>({}));
+  if(!x.ok){alert(`${data.error||'error'}: ${data.message||''}${data.details?'\n'+JSON.stringify(data.details):''}`);return null}
+  return data;
+}
+async function load(){
+  const s=await api('/api/state',null,'GET');if(!s)return;
+  clock.textContent='服务端时间 '+s.server_time;
+  rawSec.style.display=raw?'block':'none';if(raw)rawJson.textContent=JSON.stringify(s,null,2);
+  const stalePlans=s.plans.filter(p=>p.status==='stale');
+  const review=s.flights.filter(f=>f.status==='pending_review');
+  const failed=s.plans.filter(p=>p.apply_status==='failed');
+  banners.innerHTML=[
+    review.length&&`<div class="banner">⚠️ ${review.length} 个未执行航班因中断修订更新转为<b>待复核</b>：${review.map(f=>esc(f.flight_no)).join('、')}，请在下方复核后才能执行。</div>`,
+    stalePlans.length&&`<div class="banner err">⛔ ${stalePlans.length} 个已锁定方案基于旧版中断事件，已<b>过期失效</b>，需要重做：${stalePlans.map(p=>'#'+p.id+' '+esc(p.name)).join('、')}</div>`,
+    failed.length&&`<div class="banner err">❌ ${failed.length} 个方案上次处理失败并已自动恢复原方案，可重试：${failed.map(p=>'#'+p.id).join('、')}</div>`
+  ].filter(Boolean).join('');
+  disruptions.innerHTML=`<table><tr><th>ID</th><th>类型</th><th>资源</th><th>窗口</th><th>修订</th><th>更新人/时间</th></tr>${s.disruptions.map(d=>
+    `<tr><td>${d.id}</td><td>${esc(d.kind)}</td><td>${esc(d.resource_id)}</td><td>${d.starts_at}<br>→ ${d.ends_at}</td><td><b>r${d.revision}</b></td><td class="muted">${esc(d.updated_by||'-')}<br>${esc(d.updated_at||'-')}</td></tr>`).join('')}</table>`;
+  flights.innerHTML=`<table><tr><th>航班</th><th>航线</th><th>STD→STA</th><th>飞机/机组</th><th>状态</th><th>修订</th></tr>${s.flights.map(f=>
+    `<tr class="${f.status==='pending_review'?'review-row':''}"><td>${esc(f.flight_no)}</td><td>${esc(f.origin)}→${esc(f.destination)}</td><td>${f.std}<br>→ ${f.sta}</td><td>${esc(f.aircraft_id)} / ${esc(f.crew_id)}</td><td>${tag(f.status,fstatus[f.status]||f.status)}${f.cancel_reason?`<div class="muted">${esc(f.cancel_reason)}</div>`:''}</td><td>r${f.revision}</td></tr>`).join('')}</table>`;
+  plans.innerHTML=s.plans.map(p=>{
+    const based=p.disruption_revision,cur=p.disruption_current_revision,outdated=based<cur;
+    const pcls=p.status==='stale'?'stale':p.status;
+    const rows=p.assignments.map(a=>`<tr><td>${esc(a.flight_no)}</td><td>${a.new_std}</td><td>${esc(a.aircraft_id)}/${esc(a.crew_id)}</td><td>${a.status==='canceled'?tag('canceled','取消'):(a.applied?tag('succeeded','已写入'):tag('pending','未写入'))}${a.reverted_at?` <span class="muted">已撤回</span>`:''}</td></tr>`).join('');
+    return `<div class="${p.status==='stale'?'stale-row':''}" style="border:1px solid #e2e8f0;border-radius:8px;padding:10px;margin:10px 0">
+      <b>方案 #${p.id} ${esc(p.name)}</b>
+      ${tag(pcls,p.status==='stale'?'已过期':p.status)}
+      ${tag(p.apply_status,astatus[p.apply_status]||p.apply_status)}
+      ${outdated?tag('stale',`中断 r${based}→最新 r${cur}`):`<span class="muted">基于中断 r${based}</span>`}
+      <span class="muted">锁定人 ${esc(p.locked_by||'-')} ${p.locked_at||''}</span>
+      ${p.result?`<pre>${esc(JSON.stringify(p.result,null,2))}</pre>`:''}
+      <table><tr><th>航班</th><th>新 STD</th><th>飞机/机组</th><th>写入情况</th></tr>${rows}</table>
+    </div>`}).join('') || '<p class="muted">暂无方案</p>';
+}
+load();
+</script>

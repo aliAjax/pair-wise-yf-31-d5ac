@@ -16,12 +16,29 @@ python3 app.py --db airline_recovery.db
 
 - `POST /api/airports`、`/api/aircraft`、`/api/crew`、`/api/permits`：基础资源与约束。
 - `POST /api/flights`、`POST /api/disruptions`：创建航班和中断。
-- `POST /api/recovery-plans`：一次提交方案及航班调整。
+- `POST /api/disruptions/{id}/update`：更新中断窗口/信息（带 `expected_revision`），修订号前进。
+- `POST /api/recovery-plans`：一次提交方案及航班调整（记录所基于的中断修订）。
 - `POST /api/plans/{id}/assignments`：用 `expected_revision` 临时改派。
-- `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案。
+- `POST /api/plans/{id}/rebase`：草案重新对齐最新中断修订（旧修订上不能锁定）。
+- `POST /api/plans/{id}/validate`、`/lock`：校验并原子锁定方案（只占资源，不改航班）。
+- `POST /api/plans/{id}/process`：处理方案，把调整按快照写入航班；失败自动恢复原方案，重试幂等。
+- `POST /api/plans/{id}/restore`：撤稿，只回退本方案写入、未被执行或接管的航班值。
 - `GET /api/disruptions/{id}/compare`：比较恢复方案成本。
-- `POST /api/flights/{id}/cancel`、`/recover`：取消和人工恢复。
-- `GET /api/state`、`GET /api/plans/{id}`：查询状态和影响。
+- `POST /api/flights/{id}/cancel`、`/recover`、`/execute`、`/review`：取消、人工恢复、标记执行、待复核确认。
+- `GET /api/state`、`GET /api/plans/{id}`：查询状态、过期标记（`stale`）和处理结果（`result`）。
+
+## 修订链路
+
+中断事件、恢复方案、航班执行共用一条修订链：
+
+1. `disruptions.revision` 是链路源头，方案记录 `disruption_revision`。
+2. 更新中断信息后版本号 +1，依赖旧版本的锁定方案变为 `stale`（过期），其未执行/未取消且未被新方案接管的航班转为 `pending_review`，调度台必须 `review`（`keep` 接受现值或 `restore` 回退）后才能执行。
+3. `lock` 只做约束校验和飞机/机组资源占位，`process` 才写航班值。写入前把航班原值快照存到 assignment（时刻、资源、状态、版本号、写入者）。
+4. 处理失败按快照自动恢复原方案；重试只处理 `applied=0` 的调整，不重复改航班；成功后重复提交为幂等返回，不重复占用资源。
+5. `restore` 只撤本方案写入的航班值（写入者守卫）；已执行、已人工取消、已被其他方案接管的航班跳过并在结果中列出。
+6. 所有写操作要求 `expected_revision`，后提交方在版本不一致时收到 409 `revision_conflict`，响应体 `details.current` 带最新状态。写事务在单进程内串行化（`BEGIN IMMEDIATE` + 写锁）。
+
+页面顶部会汇总待复核航班、过期方案和处理失败方案，并在方案卡片上展示所基于的中断修订与最新修订的差异。
 
 ## 测试
 
